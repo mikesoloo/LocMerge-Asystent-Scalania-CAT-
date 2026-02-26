@@ -319,6 +319,8 @@ const css = `
   .btn-s:hover { border-color:var(--acc); color:var(--acc); background:rgba(13,158,116,.04); }
   .btn-docx { display:block; width:100%; font-family:'Segoe UI',system-ui,sans-serif; font-size:13px; font-weight:700; letter-spacing:1px; text-transform:uppercase; padding:13px 16px; border:2px solid var(--acc2); cursor:pointer; transition:all .15s; border-radius:4px; margin-top:8px; background:rgba(107,72,200,.07); color:var(--acc2); }
   .btn-docx:hover { background:var(--acc2); color:#fff; }
+  .btn-clear { display:block; width:100%; font-family:'Segoe UI',system-ui,sans-serif; font-size:13px; font-weight:600; letter-spacing:1px; text-transform:uppercase; padding:13px 16px; border:1px solid var(--bd); cursor:pointer; transition:all .15s; border-radius:4px; margin-top:16px; background:var(--s1); color:var(--mu); }
+  .btn-clear:hover { border-color:var(--er); color:var(--er); background:rgba(192,40,62,.04); }
   .content { padding:28px 36px; display:flex; flex-direction:column; gap:18px; overflow:auto; }
   .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; }
   .stat { background:var(--s1); border:1px solid var(--bd); padding:16px 20px; border-radius:6px; box-shadow:0 1px 3px rgba(0,0,0,.05); }
@@ -537,6 +539,13 @@ export default function App() {
     setModal({ content, filename });
   };
 
+  const clearAll = () => {
+    setFiles([]);
+    setResult(null);
+    setSearch("");
+    setTab("table");
+  };
+
   const masterFiles = files.filter((f) => f.role === "master");
   const batchFiles  = files.filter((f) => f.role === "batch");
   const canRun      = masterFiles.length > 0;
@@ -631,6 +640,9 @@ export default function App() {
                     <button className="btn btn-docx" onClick={handleExportDOCX}>⬇ Zapisz do DOCX</button>
                   )}
                 </>
+              )}
+              {(files.length > 0 || result) && (
+                <button className="btn-clear" onClick={clearAll}>↺ Wyczyść</button>
               )}
             </div>
           </aside>
