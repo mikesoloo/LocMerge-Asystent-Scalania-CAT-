@@ -70,6 +70,22 @@ function findBestTable(tables) {
   return bestTable;
 }
 
+// Returns ALL tables that look like data tables (with ID + content headers).
+// Falls back to [findBestTable()] for files that have only one data table.
+function findAllDataTables(tables) {
+  const result = tables.filter((tbl) => {
+    const trs = tbl.getElementsByTagName("w:tr");
+    if (trs.length < 2) return false;
+    const headerCells = getRowTexts(trs[0]).filter(Boolean);
+    return isDataHeader(headerCells);
+  });
+  if (!result.length) {
+    const best = findBestTable(tables);
+    if (best) return [best];
+  }
+  return result;
+}
+
 function setCellText(tc, text) {
   const ownerDoc = tc.ownerDocument;
   const paras = Array.from(tc.getElementsByTagName("w:p"));
@@ -111,17 +127,22 @@ async function parseDOCX(arrayBuffer) {
   const doc = new DOMParser().parseFromString(xml, "text/xml");
   const tables = Array.from(doc.getElementsByTagName("w:tbl"));
   if (!tables.length) return { headers: [], rows: [] };
-  const bestTable = findBestTable(tables);
-  if (!bestTable) return { headers: [], rows: [] };
-  const trs = bestTable.getElementsByTagName("w:tr");
-  const headers = getRowTexts(trs[0]).filter(Boolean);
+  const dataTables = findAllDataTables(tables);
+  if (!dataTables.length) return { headers: [], rows: [] };
+  // Headers from the first data table
+  const firstTrs = dataTables[0].getElementsByTagName("w:tr");
+  const headers = getRowTexts(firstTrs[0]).filter(Boolean);
   if (!headers.length) return { headers: [], rows: [] };
-  const rows = Array.from(trs).slice(1).map((tr) => {
-    const cells = getRowTexts(tr);
-    const obj = {};
-    headers.forEach((h, i) => { obj[h] = (cells[i] || "").trim(); });
-    return obj;
-  });
+  // Collect rows from ALL data tables in document order
+  const rows = [];
+  for (const tbl of dataTables) {
+    Array.from(tbl.getElementsByTagName("w:tr")).slice(1).forEach((tr) => {
+      const cells = getRowTexts(tr);
+      const obj = {};
+      headers.forEach((h, i) => { obj[h] = (cells[i] || "").trim(); });
+      rows.push(obj);
+    });
+  }
   return { headers, rows };
 }
 
@@ -130,35 +151,48 @@ async function exportToDOCX(buffer, rows, idCol, srcCol, tgtCol, scCol) {
   const xmlStr = await zip.file("word/document.xml").async("string");
   const doc = new DOMParser().parseFromString(xmlStr, "text/xml");
   const tables = Array.from(doc.getElementsByTagName("w:tbl"));
-  const bestTable = findBestTable(tables);
-  if (!bestTable) return null;
+  const dataTables = findAllDataTables(tables);
+  if (!dataTables.length) return null;
 
-  const allTrs = Array.from(bestTable.getElementsByTagName("w:tr"));
-  const dataRows = allTrs.slice(1); // skip header row
   const colOrder = [idCol, srcCol, tgtCol, scCol].filter(Boolean);
+  let rowOffset = 0;
 
-  // Update existing rows
-  for (let ri = 0; ri < Math.min(rows.length, dataRows.length); ri++) {
-    const tcs = Array.from(dataRows[ri].getElementsByTagName("w:tc"));
-    colOrder.forEach((col, ci) => {
-      if (ci < tcs.length) setCellText(tcs[ci], rows[ri][col] || "");
-    });
-  }
+  for (const tbl of dataTables) {
+    const allTrs = Array.from(tbl.getElementsByTagName("w:tr"));
+    const dataRows = allTrs.slice(1); // skip header row
 
-  // Add new rows if result has more than original
-  const templateRow = dataRows[dataRows.length - 1] || allTrs[allTrs.length - 1];
-  for (let ri = dataRows.length; ri < rows.length; ri++) {
-    const newTr = templateRow.cloneNode(true);
-    const tcs = Array.from(newTr.getElementsByTagName("w:tc"));
-    colOrder.forEach((col, ci) => {
-      if (ci < tcs.length) setCellText(tcs[ci], rows[ri][col] || "");
-    });
-    bestTable.appendChild(newTr);
-  }
+    // Take only as many rows as this table originally had;
+    // remaining rows will go into subsequent tables.
+    const tableRows = rows.slice(rowOffset, rowOffset + dataRows.length);
+    rowOffset += dataRows.length;
 
-  // Remove excess rows if original has more than result
-  for (let ri = rows.length; ri < dataRows.length; ri++) {
-    if (dataRows[ri].parentNode) dataRows[ri].parentNode.removeChild(dataRows[ri]);
+    // Update existing rows
+    for (let ri = 0; ri < Math.min(tableRows.length, dataRows.length); ri++) {
+      const tcs = Array.from(dataRows[ri].getElementsByTagName("w:tc"));
+      colOrder.forEach((col, ci) => {
+        if (ci < tcs.length) setCellText(tcs[ci], tableRows[ri][col] || "");
+      });
+    }
+
+    // Add new rows if this table slice has more than the original table had
+    if (tableRows.length > dataRows.length) {
+      const templateRow = dataRows[dataRows.length - 1] || allTrs[allTrs.length - 1];
+      for (let ri = dataRows.length; ri < tableRows.length; ri++) {
+        const newTr = templateRow.cloneNode(true);
+        const tcs = Array.from(newTr.getElementsByTagName("w:tc"));
+        colOrder.forEach((col, ci) => {
+          if (ci < tcs.length) setCellText(tcs[ci], tableRows[ri][col] || "");
+        });
+        tbl.appendChild(newTr);
+      }
+    }
+
+    // Remove excess rows if this table slice has fewer rows than original
+    for (let ri = tableRows.length; ri < dataRows.length; ri++) {
+      if (dataRows[ri].parentNode) dataRows[ri].parentNode.removeChild(dataRows[ri]);
+    }
+
+    if (rowOffset >= rows.length) break;
   }
 
   const newXml = new XMLSerializer().serializeToString(doc);
