@@ -29,34 +29,27 @@ function parseXLSX(arrayBuffer) {
   return { headers, rows };
 }
 
-async function parseDOCX(arrayBuffer) {
-  const zip = await JSZip.loadAsync(arrayBuffer);
-  const xmlFile = zip.file("word/document.xml");
-  if (!xmlFile) return { headers: [], rows: [] };
-  const xml = await xmlFile.async("string");
-  const doc = new DOMParser().parseFromString(xml, "text/xml");
-  const tables = Array.from(doc.getElementsByTagName("w:tbl"));
-  if (!tables.length) return { headers: [], rows: [] };
+const W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 
-  const getRowTexts = (tr) => {
-    const cells = tr.getElementsByTagName("w:tc");
-    return Array.from(cells).map((tc) => {
-      const texts = tc.getElementsByTagName("w:t");
-      return Array.from(texts).map((t) => t.textContent).join("").trim();
-    });
-  };
+function getRowTexts(tr) {
+  const cells = tr.getElementsByTagName("w:tc");
+  return Array.from(cells).map((tc) => {
+    const texts = tc.getElementsByTagName("w:t");
+    return Array.from(texts).map((t) => t.textContent).join("").trim();
+  });
+}
 
-  // Find the best table: one whose first row looks like a translation data header
-  const isDataHeader = (cells) => {
-    const lc = cells.map((h) => h.toLowerCase());
-    const hasId = lc.some((h) => h === "id" || h.startsWith("id") || h.includes(" id"));
-    const hasContent = lc.some((h) =>
-      h.includes("source") || h.includes("target") ||
-      h.includes("translation") || h.includes("score")
-    );
-    return hasId && hasContent;
-  };
+function isDataHeader(cells) {
+  const lc = cells.map((h) => h.toLowerCase());
+  const hasId = lc.some((h) => h === "id" || h.startsWith("id") || h.includes(" id"));
+  const hasContent = lc.some((h) =>
+    h.includes("source") || h.includes("target") ||
+    h.includes("translation") || h.includes("score")
+  );
+  return hasId && hasContent;
+}
 
+function findBestTable(tables) {
   let bestTable = null;
   let bestRows = 0;
   for (const tbl of tables) {
@@ -68,26 +61,143 @@ async function parseDOCX(arrayBuffer) {
       bestRows = trs.length;
     }
   }
-
-  // Fallback: take the largest table
   if (!bestTable) {
     for (const tbl of tables) {
       const n = tbl.getElementsByTagName("w:tr").length;
       if (n > bestRows) { bestTable = tbl; bestRows = n; }
     }
   }
+  return bestTable;
+}
 
-  if (!bestTable) return { headers: [], rows: [] };
-  const trs = bestTable.getElementsByTagName("w:tr");
-  const headers = getRowTexts(trs[0]).filter(Boolean);
-  if (!headers.length) return { headers: [], rows: [] };
-  const rows = Array.from(trs).slice(1).map((tr) => {
-    const cells = getRowTexts(tr);
-    const obj = {};
-    headers.forEach((h, i) => { obj[h] = (cells[i] || "").trim(); });
-    return obj;
+// Returns ALL tables that look like data tables (with ID + content headers).
+// Falls back to [findBestTable()] for files that have only one data table.
+function findAllDataTables(tables) {
+  const result = tables.filter((tbl) => {
+    const trs = tbl.getElementsByTagName("w:tr");
+    if (trs.length < 2) return false;
+    const headerCells = getRowTexts(trs[0]).filter(Boolean);
+    return isDataHeader(headerCells);
   });
+  if (!result.length) {
+    const best = findBestTable(tables);
+    if (best) return [best];
+  }
+  return result;
+}
+
+function setCellText(tc, text) {
+  const ownerDoc = tc.ownerDocument;
+  const paras = Array.from(tc.getElementsByTagName("w:p"));
+  if (!paras.length) return;
+  const firstPara = paras[0];
+  // Remove extra paragraphs (keep first)
+  for (let i = paras.length - 1; i >= 1; i--) {
+    if (paras[i].parentNode === tc) tc.removeChild(paras[i]);
+  }
+  // Get or create a run
+  const runs = Array.from(firstPara.getElementsByTagName("w:r"));
+  let run;
+  if (runs.length > 0) {
+    run = runs[0];
+    for (let i = runs.length - 1; i >= 1; i--) {
+      if (runs[i].parentNode === firstPara) firstPara.removeChild(runs[i]);
+    }
+    Array.from(run.getElementsByTagName("w:t")).forEach((t) => {
+      if (t.parentNode === run) run.removeChild(t);
+    });
+  } else {
+    run = ownerDoc.createElementNS(W_NS, "w:r");
+    firstPara.appendChild(run);
+  }
+  const tEl = ownerDoc.createElementNS(W_NS, "w:t");
+  const str = text || "";
+  if (str.startsWith(" ") || str.endsWith(" ")) {
+    tEl.setAttribute("xml:space", "preserve");
+  }
+  tEl.textContent = str;
+  run.appendChild(tEl);
+}
+
+async function parseDOCX(arrayBuffer) {
+  const zip = await JSZip.loadAsync(arrayBuffer);
+  const xmlFile = zip.file("word/document.xml");
+  if (!xmlFile) return { headers: [], rows: [] };
+  const xml = await xmlFile.async("string");
+  const doc = new DOMParser().parseFromString(xml, "text/xml");
+  const tables = Array.from(doc.getElementsByTagName("w:tbl"));
+  if (!tables.length) return { headers: [], rows: [] };
+  const dataTables = findAllDataTables(tables);
+  if (!dataTables.length) return { headers: [], rows: [] };
+  // Headers from the first data table
+  const firstTrs = dataTables[0].getElementsByTagName("w:tr");
+  const headers = getRowTexts(firstTrs[0]).filter(Boolean);
+  if (!headers.length) return { headers: [], rows: [] };
+  // Collect rows from ALL data tables in document order
+  const rows = [];
+  for (const tbl of dataTables) {
+    Array.from(tbl.getElementsByTagName("w:tr")).slice(1).forEach((tr) => {
+      const cells = getRowTexts(tr);
+      const obj = {};
+      headers.forEach((h, i) => { obj[h] = (cells[i] || "").trim(); });
+      rows.push(obj);
+    });
+  }
   return { headers, rows };
+}
+
+async function exportToDOCX(buffer, rows, idCol, srcCol, tgtCol, scCol) {
+  const zip = await JSZip.loadAsync(buffer);
+  const xmlStr = await zip.file("word/document.xml").async("string");
+  const doc = new DOMParser().parseFromString(xmlStr, "text/xml");
+  const tables = Array.from(doc.getElementsByTagName("w:tbl"));
+  const dataTables = findAllDataTables(tables);
+  if (!dataTables.length) return null;
+
+  const colOrder = [idCol, srcCol, tgtCol, scCol].filter(Boolean);
+  let rowOffset = 0;
+
+  for (const tbl of dataTables) {
+    const allTrs = Array.from(tbl.getElementsByTagName("w:tr"));
+    const dataRows = allTrs.slice(1); // skip header row
+
+    // Take only as many rows as this table originally had;
+    // remaining rows will go into subsequent tables.
+    const tableRows = rows.slice(rowOffset, rowOffset + dataRows.length);
+    rowOffset += dataRows.length;
+
+    // Update existing rows
+    for (let ri = 0; ri < Math.min(tableRows.length, dataRows.length); ri++) {
+      const tcs = Array.from(dataRows[ri].getElementsByTagName("w:tc"));
+      colOrder.forEach((col, ci) => {
+        if (ci < tcs.length) setCellText(tcs[ci], tableRows[ri][col] || "");
+      });
+    }
+
+    // Add new rows if this table slice has more than the original table had
+    if (tableRows.length > dataRows.length) {
+      const templateRow = dataRows[dataRows.length - 1] || allTrs[allTrs.length - 1];
+      for (let ri = dataRows.length; ri < tableRows.length; ri++) {
+        const newTr = templateRow.cloneNode(true);
+        const tcs = Array.from(newTr.getElementsByTagName("w:tc"));
+        colOrder.forEach((col, ci) => {
+          if (ci < tcs.length) setCellText(tcs[ci], tableRows[ri][col] || "");
+        });
+        tbl.appendChild(newTr);
+      }
+    }
+
+    // Remove excess rows if this table slice has fewer rows than original
+    for (let ri = tableRows.length; ri < dataRows.length; ri++) {
+      if (dataRows[ri].parentNode) dataRows[ri].parentNode.removeChild(dataRows[ri]);
+    }
+
+    if (rowOffset >= rows.length) break;
+  }
+
+  const newXml = new XMLSerializer().serializeToString(doc);
+  zip.file("word/document.xml", newXml);
+  return await zip.generateAsync({ type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } });
 }
 
 function isXLSX(filename) {
@@ -207,6 +317,8 @@ const css = `
   .btn-p:disabled { background:var(--bd); border-color:var(--bd); color:var(--mu); cursor:not-allowed; }
   .btn-s { background:var(--s1); color:var(--tx); border-color:var(--bd); }
   .btn-s:hover { border-color:var(--acc); color:var(--acc); background:rgba(13,158,116,.04); }
+  .btn-docx { display:block; width:100%; font-family:'Segoe UI',system-ui,sans-serif; font-size:13px; font-weight:700; letter-spacing:1px; text-transform:uppercase; padding:13px 16px; border:2px solid var(--acc2); cursor:pointer; transition:all .15s; border-radius:4px; margin-top:8px; background:rgba(107,72,200,.07); color:var(--acc2); }
+  .btn-docx:hover { background:var(--acc2); color:#fff; }
   .content { padding:28px 36px; display:flex; flex-direction:column; gap:18px; overflow:auto; }
   .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; }
   .stat { background:var(--s1); border:1px solid var(--bd); padding:16px 20px; border-radius:6px; box-shadow:0 1px 3px rgba(0,0,0,.05); }
@@ -339,7 +451,8 @@ export default function App() {
         const { headers, rows } = parsed;
         if (!headers.length) return;
         const role = forceRole || detectRole(headers);
-        setFiles((prev) => prev.find((f) => f.name === file.name) ? prev : [...prev, { name: file.name, role, headers, rows }]);
+        const buffer = isDOCX(file.name) ? e.target.result : null;
+        setFiles((prev) => prev.find((f) => f.name === file.name) ? prev : [...prev, { name: file.name, role, headers, rows, buffer }]);
       };
       if (isDOCX(file.name) || isXLSX(file.name)) {
         reader.readAsArrayBuffer(file);
@@ -388,8 +501,33 @@ export default function App() {
     log.push({ t: ts(), k: filled ? "ok" : "warn", m: `Uzupełniono: ${filled} / Brak: ${missing}` });
     // Output always in canonical order: ID, Source, Target, Score
     const outHeaders = [idCol, srcCol, tgtCol, scCol].filter(Boolean);
-    setResult({ headers: outHeaders, rows, log, stats: { total: master.rows.length, filled, missing, batches: batches.length } });
+    setResult({
+      headers: outHeaders, rows, log,
+      stats: { total: master.rows.length, filled, missing, batches: batches.length },
+      masterBuffer: master.buffer || null,
+      masterName: master.name,
+      idCol, srcCol, tgtCol, scCol,
+    });
     setTab("table");
+  };
+
+  const handleExportDOCX = async () => {
+    if (!result?.masterBuffer) return;
+    const blob = await exportToDOCX(
+      result.masterBuffer, result.rows,
+      result.idCol, result.srcCol, result.tgtCol, result.scCol
+    );
+    if (!blob) return;
+    const ext = result.masterName.match(/\.[^.]+$/)?.[0] || ".docx";
+    const baseName = result.masterName.replace(/\.[^.]+$/, "");
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = baseName + "_consolidated" + ext;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   };
 
   const openExport = (type) => {
@@ -489,6 +627,9 @@ export default function App() {
                 <>
                   <button className="btn btn-s" onClick={() => openExport("tsv")}>↓ Eksport TSV</button>
                   <button className="btn btn-s" onClick={() => openExport("md")}>↓ Eksport Markdown</button>
+                  {result.masterBuffer && (
+                    <button className="btn btn-docx" onClick={handleExportDOCX}>⬇ Zapisz do DOCX</button>
+                  )}
                 </>
               )}
             </div>
