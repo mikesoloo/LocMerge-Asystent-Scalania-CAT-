@@ -86,6 +86,46 @@ function findAllDataTables(tables) {
   return result;
 }
 
+// Phrase/Memsource exports have a separate 1-row header table followed by
+// a headerless data table. This function finds that 1-row header table.
+function detectPhraseHeaderTable(tables) {
+  return tables.find((tbl) => {
+    const trs = tbl.getElementsByTagName("w:tr");
+    if (trs.length !== 1) return false;
+    const cells = getRowTexts(trs[0]).filter(Boolean);
+    return isDataHeader(cells);
+  }) || null;
+}
+
+// Returns "phrase" when the document has the Phrase/Memsource structure
+// (separate header table + headerless data table), otherwise "txlf".
+function detectDOCXFormat(tables) {
+  const hdrTbl = detectPhraseHeaderTable(tables);
+  if (!hdrTbl) return "txlf";
+  const idx = tables.indexOf(hdrTbl);
+  const next = tables[idx + 1];
+  return (next && next.getElementsByTagName("w:tr").length >= 1) ? "phrase" : "txlf";
+}
+
+// Parse Phrase format: headers come from the 1-row header table,
+// data rows come from the immediately following table.
+function parseDOCXPhraseInternal(tables) {
+  const hdrTbl = detectPhraseHeaderTable(tables);
+  if (!hdrTbl) return { headers: [], rows: [] };
+  const headers = getRowTexts(hdrTbl.getElementsByTagName("w:tr")[0]);
+  if (!headers.length) return { headers: [], rows: [] };
+  const hdrIdx = tables.indexOf(hdrTbl);
+  const dataTbl = tables[hdrIdx + 1];
+  if (!dataTbl) return { headers: [], rows: [] };
+  const rows = Array.from(dataTbl.getElementsByTagName("w:tr")).map((tr) => {
+    const cells = getRowTexts(tr);
+    const obj = {};
+    headers.forEach((h, i) => { obj[h] = (cells[i] || "").trim(); });
+    return obj;
+  });
+  return { headers, rows };
+}
+
 function setCellText(tc, text) {
   const ownerDoc = tc.ownerDocument;
   const paras = Array.from(tc.getElementsByTagName("w:p"));
@@ -122,18 +162,25 @@ function setCellText(tc, text) {
 async function parseDOCX(arrayBuffer) {
   const zip = await JSZip.loadAsync(arrayBuffer);
   const xmlFile = zip.file("word/document.xml");
-  if (!xmlFile) return { headers: [], rows: [] };
+  if (!xmlFile) return { headers: [], rows: [], format: "txlf" };
   const xml = await xmlFile.async("string");
   const doc = new DOMParser().parseFromString(xml, "text/xml");
   const tables = Array.from(doc.getElementsByTagName("w:tbl"));
-  if (!tables.length) return { headers: [], rows: [] };
+  if (!tables.length) return { headers: [], rows: [], format: "txlf" };
+
+  const format = detectDOCXFormat(tables);
+
+  if (format === "phrase") {
+    const { headers, rows } = parseDOCXPhraseInternal(tables);
+    return { headers, rows, format: "phrase" };
+  }
+
+  // --- TXLF / standard multi-table DOCX ---
   const dataTables = findAllDataTables(tables);
-  if (!dataTables.length) return { headers: [], rows: [] };
-  // Headers from the first data table
+  if (!dataTables.length) return { headers: [], rows: [], format: "txlf" };
   const firstTrs = dataTables[0].getElementsByTagName("w:tr");
   const headers = getRowTexts(firstTrs[0]).filter(Boolean);
-  if (!headers.length) return { headers: [], rows: [] };
-  // Collect rows from ALL data tables in document order
+  if (!headers.length) return { headers: [], rows: [], format: "txlf" };
   const rows = [];
   for (const tbl of dataTables) {
     Array.from(tbl.getElementsByTagName("w:tr")).slice(1).forEach((tr) => {
@@ -143,7 +190,7 @@ async function parseDOCX(arrayBuffer) {
       rows.push(obj);
     });
   }
-  return { headers, rows };
+  return { headers, rows, format: "txlf" };
 }
 
 async function exportToDOCX(buffer, rows, idCol, srcCol, tgtCol, scCol) {
@@ -193,6 +240,60 @@ async function exportToDOCX(buffer, rows, idCol, srcCol, tgtCol, scCol) {
     }
 
     if (rowOffset >= rows.length) break;
+  }
+
+  const newXml = new XMLSerializer().serializeToString(doc);
+  zip.file("word/document.xml", newXml);
+  return await zip.generateAsync({ type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } });
+}
+
+// Export for Phrase/Memsource format: writes only the target column (by header
+// index) into the headerless data table that follows the 1-row header table.
+async function exportToDOCXPhrase(buffer, rows, idCol, srcCol, tgtCol, scCol) {
+  const zip = await JSZip.loadAsync(buffer);
+  const xmlStr = await zip.file("word/document.xml").async("string");
+  const doc = new DOMParser().parseFromString(xmlStr, "text/xml");
+  const tables = Array.from(doc.getElementsByTagName("w:tbl"));
+  const hdrTbl = detectPhraseHeaderTable(tables);
+  if (!hdrTbl) return null;
+  const headers = getRowTexts(hdrTbl.getElementsByTagName("w:tr")[0]);
+  const hdrIdx = tables.indexOf(hdrTbl);
+  const dataTbl = tables[hdrIdx + 1];
+  if (!dataTbl) return null;
+
+  // Only update columns that are in the result (using their original indices).
+  const colOrder = [idCol, srcCol, tgtCol, scCol].filter(Boolean);
+  const colIndices = colOrder.map((col) => headers.indexOf(col));
+
+  const dataRows = Array.from(dataTbl.getElementsByTagName("w:tr"));
+
+  for (let ri = 0; ri < Math.min(rows.length, dataRows.length); ri++) {
+    const tcs = Array.from(dataRows[ri].getElementsByTagName("w:tc"));
+    colOrder.forEach((col, ci) => {
+      const colIdx = colIndices[ci];
+      if (colIdx >= 0 && colIdx < tcs.length) {
+        setCellText(tcs[colIdx], rows[ri][col] || "");
+      }
+    });
+  }
+
+  if (rows.length > dataRows.length) {
+    const templateRow = dataRows[dataRows.length - 1];
+    for (let ri = dataRows.length; ri < rows.length; ri++) {
+      const newTr = templateRow.cloneNode(true);
+      const tcs = Array.from(newTr.getElementsByTagName("w:tc"));
+      colOrder.forEach((col, ci) => {
+        const colIdx = colIndices[ci];
+        if (colIdx >= 0 && colIdx < tcs.length) {
+          setCellText(tcs[colIdx], rows[ri][col] || "");
+        }
+      });
+      dataTbl.appendChild(newTr);
+    }
+  }
+
+  for (let ri = rows.length; ri < dataRows.length; ri++) {
+    if (dataRows[ri].parentNode) dataRows[ri].parentNode.removeChild(dataRows[ri]);
   }
 
   const newXml = new XMLSerializer().serializeToString(doc);
@@ -268,6 +369,12 @@ function findTranslationCol(headers) {
   );
 }
 
+// In Phrase/Memsource exports the "#" column is the numeric sequence number
+// that matches the "ID" column in batch files.
+function findPhraseNumericIdCol(headers) {
+  return headers.find((h) => h.trim() === "#") || null;
+}
+
 const css = `
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   :root {
@@ -307,6 +414,7 @@ const css = `
   .ftag { padding:3px 7px; font-size:10px; font-weight:700; letter-spacing:1px; text-transform:uppercase; flex-shrink:0; border-radius:3px; }
   .ftag-m { background:rgba(13,158,116,.12); color:var(--acc); border:1px solid rgba(13,158,116,.3); }
   .ftag-b { background:rgba(107,72,200,.1); color:#5a38b0; border:1px solid rgba(107,72,200,.25); }
+  .ftag-fmt { background:rgba(14,107,187,.1); color:#0e6bbb; border:1px solid rgba(14,107,187,.25); font-size:9px; padding:2px 5px; }
   .xbtn { background:none; border:none; color:var(--mu); cursor:pointer; font-size:18px; padding:0 2px; line-height:1; }
   .xbtn:hover { color:var(--er); }
   hr.div { border:none; border-top:1px solid var(--bd); }
@@ -357,6 +465,7 @@ const css = `
   .c-src { color:var(--tx); }
   .c-tgt { color:#0a6644; font-weight:500; }
   .c-emp { color:var(--mu); font-style:italic; }
+  .c-seq { color:#0e6bbb; font-size:12px; font-weight:700; width:40px; font-family:'Courier New',monospace; }
   .pre { background:var(--s2); border:1px solid var(--bd); padding:18px; font-size:12px; line-height:1.9; white-space:pre-wrap; overflow:auto; max-height:420px; color:var(--tx); border-radius:4px; font-family:'Courier New',monospace; }
   .empty { display:flex; flex-direction:column; align-items:center; justify-content:center; padding:80px 40px; text-align:center; gap:12px; border:2px dashed var(--bd); border-radius:6px; color:var(--mu); }
   .ei { font-size:40px; opacity:.25; }
@@ -450,11 +559,11 @@ export default function App() {
             : new TextDecoder().decode(e.target.result);
           parsed = parseTSV(text);
         }
-        const { headers, rows } = parsed;
+        const { headers, rows, format } = parsed;
         if (!headers.length) return;
         const role = forceRole || detectRole(headers);
         const buffer = isDOCX(file.name) ? e.target.result : null;
-        setFiles((prev) => prev.find((f) => f.name === file.name) ? prev : [...prev, { name: file.name, role, headers, rows, buffer }]);
+        setFiles((prev) => prev.find((f) => f.name === file.name) ? prev : [...prev, { name: file.name, role, headers, rows, buffer, format: format || "txlf" }]);
       };
       if (isDOCX(file.name) || isXLSX(file.name)) {
         reader.readAsArrayBuffer(file);
@@ -473,8 +582,10 @@ export default function App() {
     if (!masters.length) { setResult({ error: "Brak pliku Master." }); return; }
     const master  = masters[0];
     const batches = files.filter((f) => f.role === "batch");
-    log.push({ t: ts(), k: "ok", m: `Master: ${master.name} — ${master.rows.length} wierszy` });
-    const idCol  = findIdCol(master.headers);
+    log.push({ t: ts(), k: "ok", m: `Master: ${master.name} — ${master.rows.length} wierszy (format: ${master.format || "txlf"})` });
+    const idCol  = master.format === "phrase"
+      ? (findPhraseNumericIdCol(master.headers) || findIdCol(master.headers))
+      : findIdCol(master.headers);
     const srcCol = findSourceCol(master.headers);
     const tgtCol = findTargetCol(master.headers);
     const scCol  = findScoreCol(master.headers) || "Score";
@@ -508,6 +619,7 @@ export default function App() {
       stats: { total: master.rows.length, filled, missing, batches: batches.length },
       masterBuffer: master.buffer || null,
       masterName: master.name,
+      masterFormat: master.format || "txlf",
       idCol, srcCol, tgtCol, scCol,
     });
     setTab("table");
@@ -515,7 +627,8 @@ export default function App() {
 
   const handleExportDOCX = async () => {
     if (!result?.masterBuffer) return;
-    const blob = await exportToDOCX(
+    const exportFn = result.masterFormat === "phrase" ? exportToDOCXPhrase : exportToDOCX;
+    const blob = await exportFn(
       result.masterBuffer, result.rows,
       result.idCol, result.srcCol, result.tgtCol, result.scCol
     );
@@ -591,6 +704,7 @@ export default function App() {
                       <span className="ftag ftag-m">M</span>
                       <span className="fname">{f.name}</span>
                       <span className="frows">{f.rows.length}w</span>
+                      <span className="ftag ftag-fmt">{f.format === "phrase" ? "Phrase" : "TXLF"}</span>
                       <button className="xbtn" onClick={() => removeFile(f.name)}>×</button>
                     </div>
                   ))}
@@ -693,7 +807,11 @@ export default function App() {
                             <tr key={i}>
                               {result.headers.map((h) => {
                                 const hl = h.toLowerCase();
-                                const cls = hl === "id" ? "c-id" : hl === "score" ? "c-sc" : hl === "source" ? "c-src" : hl === "target" ? (row[h] ? "c-tgt" : "c-emp") : "";
+                                const cls = (hl === "id" || hl === "#") ? "c-id"
+                                  : hl === "score" ? "c-sc"
+                                  : hl.includes("source") ? "c-src"
+                                  : (hl.includes("target") || hl.includes("translation")) ? (row[h] ? "c-tgt" : "c-emp")
+                                  : "";
                                 return <td key={h} className={cls} title={row[h]}>{row[h] || (hl === "target" ? "—" : "")}</td>;
                               })}
                             </tr>
